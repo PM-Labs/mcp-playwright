@@ -3,44 +3,28 @@ ARG PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 # ------------------------------
 # Base
 # ------------------------------
-# Base stage: Contains only the minimal dependencies required for runtime
-# (node_modules and Playwright system dependencies)
+# Installs Node prod dependencies and Chromium system libraries.
+# Rewritten without --mount=type=cache/bind for Cloud Build compatibility.
 FROM node:22-bookworm-slim AS base
 
 ARG PLAYWRIGHT_BROWSERS_PATH
 ENV PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH}
 
-# Set the working directory
 WORKDIR /app
 
-RUN --mount=type=cache,target=/root/.npm,sharing=locked,id=npm-cache \
-    --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-    --mount=type=bind,source=packages/playwright-mcp/package.json,target=packages/playwright-mcp/package.json \
-  npm ci --omit=dev && \
-  # Install system dependencies for playwright
-  npx -y playwright-core install-deps chromium
+# Copy workspace manifests so npm ci can resolve all packages
+COPY package.json package-lock.json ./
+COPY packages/playwright-mcp/package.json     ./packages/playwright-mcp/
+COPY packages/playwright-cli-stub/package.json ./packages/playwright-cli-stub/
+COPY packages/extension/package.json          ./packages/extension/
 
-# ------------------------------
-# Builder
-# ------------------------------
-FROM base AS builder
-
-RUN --mount=type=cache,target=/root/.npm,sharing=locked,id=npm-cache \
-    --mount=type=bind,source=package.json,target=package.json \
-    --mount=type=bind,source=package-lock.json,target=package-lock.json \
-    --mount=type=bind,source=packages/playwright-mcp/package.json,target=packages/playwright-mcp/package.json \
-  npm ci
-
-# Copy the rest of the app
-COPY packages/playwright-mcp/*.json packages/playwright-mcp/*.js packages/playwright-mcp/*.ts .
+RUN npm ci --omit=dev && \
+    npx -y playwright-core install-deps chromium
 
 # ------------------------------
 # Browser
 # ------------------------------
-# Cache optimization:
-# - Browser is downloaded only when node_modules or Playwright system dependencies change
-# - Cache is reused when only source code changes
+# Downloads the Chromium binary into a cacheable layer.
 FROM base AS browser
 
 RUN npx -y playwright-core install --no-shell chromium
@@ -55,7 +39,6 @@ ARG USERNAME=node
 ENV NODE_ENV=production
 ENV PLAYWRIGHT_MCP_OUTPUT_DIR=/tmp/playwright-output
 
-# Set the correct ownership for the runtime user on production `node_modules`
 RUN chown -R ${USERNAME}:${USERNAME} node_modules
 
 USER ${USERNAME}
@@ -63,5 +46,5 @@ USER ${USERNAME}
 COPY --from=browser --chown=${USERNAME}:${USERNAME} ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
 COPY --chown=${USERNAME}:${USERNAME} packages/playwright-mcp/cli.js packages/playwright-mcp/oauth-server.js packages/playwright-mcp/package.json ./
 
-# OAuth proxy spawns playwright-mcp internally on port 8081 and exposes OAuth + MCP on $PORT
+# OAuth proxy spawns playwright-mcp on port 8081 internally and exposes OAuth + MCP on $PORT
 ENTRYPOINT ["node", "oauth-server.js"]
