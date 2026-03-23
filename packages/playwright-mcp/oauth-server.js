@@ -70,14 +70,28 @@ function waitForMcp() {
 
 /** Forward req → internal playwright-mcp, pipe response back (handles SSE). */
 function proxyRequest(req, res) {
+  const headers = { ...req.headers, host: `127.0.0.1:${INTERNAL_PORT}` };
+  // Strip headers that cause the internal server to reject proxied requests:
+  // - authorization: the Bearer token is consumed by this proxy, not playwright-mcp
+  // - origin: prevents CORS rejection when request originates from claude.ai
+  delete headers['authorization'];
+  delete headers['origin'];
+
   const opts = {
     hostname: '127.0.0.1',
     port: INTERNAL_PORT,
     path: req.url,
     method: req.method,
-    headers: { ...req.headers, host: `127.0.0.1:${INTERNAL_PORT}` },
+    headers,
   };
   const proxy = http.request(opts, (proxyRes) => {
+    if (proxyRes.statusCode >= 400) {
+      let body = '';
+      proxyRes.on('data', chunk => { body += chunk; });
+      proxyRes.on('end', () => {
+        console.error(`Upstream ${proxyRes.statusCode} for ${req.method} ${req.url}: ${body.slice(0, 500)}`);
+      });
+    }
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res, { end: true });
   });
