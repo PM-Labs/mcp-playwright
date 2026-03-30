@@ -342,7 +342,7 @@ const server = http.createServer(async (req, res) => {
         if (expected !== stored.codeChallenge) { json(res, 400, { error: 'invalid_grant' }); return; }
         if (redirect_uri && redirect_uri !== stored.redirectUri) { json(res, 400, { error: 'invalid_grant' }); return; }
         delete authCodes[code];
-        json(res, 200, { access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 86400 });
+        json(res, 200, { access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 2592000 });
         return;
       }
 
@@ -362,7 +362,7 @@ const server = http.createServer(async (req, res) => {
       if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
         json(res, 401, { error: 'invalid_client' }); return;
       }
-      json(res, 200, { access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 86400 });
+      json(res, 200, { access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 2592000 });
       return;
     }
 
