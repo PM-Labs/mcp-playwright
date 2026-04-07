@@ -37,7 +37,6 @@ FROM base
 ARG PLAYWRIGHT_BROWSERS_PATH
 ARG USERNAME=node
 ENV NODE_ENV=production
-ENV PLAYWRIGHT_MCP_OUTPUT_DIR=/tmp/playwright-output
 
 RUN chown -R ${USERNAME}:${USERNAME} node_modules
 
@@ -45,6 +44,9 @@ USER ${USERNAME}
 
 COPY --from=browser --chown=${USERNAME}:${USERNAME} ${PLAYWRIGHT_BROWSERS_PATH} ${PLAYWRIGHT_BROWSERS_PATH}
 COPY --chown=${USERNAME}:${USERNAME} packages/playwright-mcp/cli.js packages/playwright-mcp/oauth-server.js packages/playwright-mcp/package.json ./
+
+# Current working directory must be writable as MCP may need to create default output dir in it.
+WORKDIR /home/${USERNAME}
 
 # OAuth proxy spawns playwright-mcp on port 8081 internally and exposes OAuth + MCP on $PORT
 ENTRYPOINT ["node", "oauth-server.js"]
