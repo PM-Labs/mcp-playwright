@@ -6,8 +6,6 @@
  *   - OAuth discovery + PKCE auth endpoints on the public PORT
  *   - Bearer token gating on all other paths
  *   - Transparent proxy (including SSE streaming) to the internal MCP server
- *   - Session resurrection: if playwright-mcp returns 404 "Session not found",
- *     automatically initializes a new session and replays the request.
  *
  * Required env vars:
  *   MCP_AUTH_TOKEN      — shared secret issued as Bearer token after OAuth
@@ -32,14 +30,6 @@ const OAUTH_CLIENT_SECRET = (process.env.OAUTH_CLIENT_SECRET || '').trim();
 
 /** @type {Record<string, {codeChallenge:string, codeChallengeMethod:string, redirectUri:string, expiresAt:number}>} */
 const authCodes = {};
-
-/**
- * Maps stale session IDs to resurrected session IDs.
- * When a client sends a stale session, we create a new one and remember the mapping
- * so subsequent requests with the same stale ID get routed to the new session.
- * @type {Map<string, string>}
- */
-const sessionMap = new Map();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -78,85 +68,22 @@ function waitForMcp() {
   });
 }
 
-/** Make an HTTP request to the internal playwright-mcp and collect the full response. */
-function internalRequest(method, path, headers, body) {
-  return new Promise((resolve, reject) => {
-    const opts = {
-      hostname: '127.0.0.1',
-      port: INTERNAL_PORT,
-      path,
-      method,
-      headers,
-    };
-    const req = http.request(opts, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
-    });
-    req.on('error', reject);
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-/** Initialize a new MCP session against the internal playwright-mcp. */
-async function createSession() {
-  const initBody = JSON.stringify({
-    jsonrpc: '2.0',
-    id: `proxy-init-${Date.now()}`,
-    method: 'initialize',
-    params: {
-      protocolVersion: '2025-03-26',
-      capabilities: {},
-      clientInfo: { name: 'oauth-proxy', version: '1.0.0' },
-    },
-  });
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-    'Host': `localhost:${INTERNAL_PORT}`,
-    'Content-Length': Buffer.byteLength(initBody),
-  };
-  const res = await internalRequest('POST', '/mcp', headers, initBody);
-  if (res.statusCode !== 200) {
-    throw new Error(`Init failed: ${res.statusCode} ${res.body}`);
+/** Forward req → internal playwright-mcp, pipe response back (handles SSE). */
+function proxyRequest(req, res) {
+  // One-line visibility per /mcp request so session/header flow is debuggable
+  // without bringing back a session-rewrite proxy layer.
+  if (req.url === '/mcp') {
+    console.log('[PROXY]', req.method, req.url,
+      'session=' + (req.headers['mcp-session-id'] || 'NONE'),
+      'accept=' + (req.headers['accept'] || 'NONE'));
   }
-  const sessionId = res.headers['mcp-session-id'];
-  if (!sessionId) {
-    throw new Error('Init succeeded but no Mcp-Session-Id in response');
-  }
-
-  // Send initialized notification
-  const notifBody = JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' });
-  const notifHeaders = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/event-stream',
-    'Host': `localhost:${INTERNAL_PORT}`,
-    'Mcp-Session-Id': sessionId,
-    'Content-Length': Buffer.byteLength(notifBody),
-  };
-  await internalRequest('POST', '/mcp', notifHeaders, notifBody);
-
-  console.log(`[SESSION] Created new session: ${sessionId}`);
-  return sessionId;
-}
-
-/**
- * Forward req → internal playwright-mcp, pipe response back (handles SSE).
- * If the request body was already consumed, pass it as `bufferedBody`.
- */
-function proxyRequest(req, res, { bufferedBody, overrideSessionId } = {}) {
-  const sessionId = overrideSessionId || req.headers['mcp-session-id'] || null;
-  console.log('[PROXY]', req.method, req.url,
-    'session=' + (sessionId || 'NONE'),
-    'accept=' + (req.headers['accept'] || 'NONE'));
 
   const headers = { ...req.headers, host: `localhost:${INTERNAL_PORT}` };
+  // Strip headers that cause the internal server to reject proxied requests:
+  // - authorization: the Bearer token is consumed by this proxy, not playwright-mcp
+  // - origin: prevents CORS rejection when request originates from claude.ai
   delete headers['authorization'];
   delete headers['origin'];
-  if (overrideSessionId) {
-    headers['mcp-session-id'] = overrideSessionId;
-  }
 
   const opts = {
     hostname: '127.0.0.1',
@@ -165,7 +92,6 @@ function proxyRequest(req, res, { bufferedBody, overrideSessionId } = {}) {
     method: req.method,
     headers,
   };
-
   const proxy = http.request(opts, (proxyRes) => {
     if (proxyRes.statusCode >= 400) {
       let body = '';
@@ -182,82 +108,7 @@ function proxyRequest(req, res, { bufferedBody, overrideSessionId } = {}) {
     if (!res.headersSent) json(res, 502, { error: 'bad_gateway' });
     else res.destroy();
   });
-
-  if (bufferedBody !== undefined) {
-    proxy.write(bufferedBody);
-    proxy.end();
-  } else {
-    req.pipe(proxy, { end: true });
-  }
-}
-
-/**
- * Attempt to proxy a request; if upstream returns 404 "Session not found",
- * create a new session and replay. Only works for POST (body must be buffered).
- */
-async function proxyWithResurrection(req, res, bodyBuffer) {
-  const staleSessionId = req.headers['mcp-session-id'] || null;
-
-  // Check if we already have a mapped replacement for this stale session
-  if (staleSessionId && sessionMap.has(staleSessionId)) {
-    const mapped = sessionMap.get(staleSessionId);
-    console.log(`[SESSION] Remapping stale ${staleSessionId.slice(0, 8)}… → ${mapped.slice(0, 8)}…`);
-    proxyRequest(req, res, { bufferedBody: bodyBuffer, overrideSessionId: mapped });
-    return;
-  }
-
-  // First attempt: proxy as-is, but buffer the upstream response to check for 404
-  const headers = { ...req.headers, host: `localhost:${INTERNAL_PORT}` };
-  delete headers['authorization'];
-  delete headers['origin'];
-
-  let probeRes;
-  try {
-    probeRes = await internalRequest(req.method, req.url, headers, bodyBuffer);
-  } catch (err) {
-    console.error('Probe error:', err.message);
-    if (!res.headersSent) json(res, 502, { error: 'bad_gateway' });
-    return;
-  }
-
-  // If not a session-not-found error, return the response as-is
-  if (probeRes.statusCode !== 404 || !probeRes.body.includes('Session not found')) {
-    res.writeHead(probeRes.statusCode, probeRes.headers);
-    res.end(probeRes.body);
-    return;
-  }
-
-  // Session is stale — resurrect
-  if (!staleSessionId) {
-    // No session ID was sent but we still got 404 — just pass through
-    res.writeHead(probeRes.statusCode, probeRes.headers);
-    res.end(probeRes.body);
-    return;
-  }
-
-  console.log(`[SESSION] Stale session ${staleSessionId.slice(0, 8)}… — resurrecting`);
-  let newSessionId;
-  try {
-    newSessionId = await createSession();
-  } catch (err) {
-    console.error('[SESSION] Resurrection failed:', err.message);
-    res.writeHead(probeRes.statusCode, probeRes.headers);
-    res.end(probeRes.body);
-    return;
-  }
-
-  // Remember the mapping for future requests
-  sessionMap.set(staleSessionId, newSessionId);
-
-  // Cap map size to prevent unbounded growth
-  if (sessionMap.size > 100) {
-    const firstKey = sessionMap.keys().next().value;
-    sessionMap.delete(firstKey);
-  }
-
-  // Replay the original request with the new session
-  console.log(`[SESSION] Replaying ${req.method} ${req.url} with new session ${newSessionId.slice(0, 8)}…`);
-  proxyRequest(req, res, { bufferedBody: bodyBuffer, overrideSessionId: newSessionId });
+  req.pipe(proxy, { end: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -385,25 +236,7 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
-    // For POST requests with a session ID, use resurrection-aware proxy
-    if (req.method === 'POST' && req.headers['mcp-session-id']) {
-      const bodyBuffer = await readBody(req);
-      await proxyWithResurrection(req, res, bodyBuffer);
-      return;
-    }
-
-    // For GET requests with a stale session ID, remap if we have a replacement
-    if (req.method === 'GET' && req.headers['mcp-session-id']) {
-      const staleId = req.headers['mcp-session-id'];
-      if (sessionMap.has(staleId)) {
-        const mapped = sessionMap.get(staleId);
-        console.log(`[SESSION] GET remap ${staleId.slice(0, 8)}… → ${mapped.slice(0, 8)}…`);
-        proxyRequest(req, res, { overrideSessionId: mapped });
-        return;
-      }
-    }
-
-    // Default: proxy as-is (handles SSE via pipe)
+    // Proxy to internal playwright-mcp (handles SSE via pipe)
     proxyRequest(req, res);
 
   } catch (err) {
